@@ -1,0 +1,106 @@
+import ccxt
+import pandas as pd
+import time
+import os
+from dotenv import load_dotenv
+
+# Ortam değişkenlerini yükle
+load_dotenv()
+
+# Ortam değişkenlerinden ayarları al
+exchange_name = os.getenv("EXCHANGE", "mexc3")
+symbols = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT").split(",")]
+use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
+dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+api_key = os.getenv("API_KEY")
+api_secret = os.getenv("API_SECRET")
+timeframe = os.getenv("TIMEFRAME", "1m")
+short_window = int(os.getenv("SHORT_WINDOW", 9))
+long_window = int(os.getenv("LONG_WINDOW", 21))
+rsi_enabled = os.getenv("RSI_ENABLED", "true").lower() == "true"
+rsi_period = int(os.getenv("RSI_PERIOD", 14))
+stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", 0.20))
+take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", 0.40))
+poll_interval = int(os.getenv("POLL_INTERVAL", 15))
+
+# Borsa bağlantısı
+exchange_class = getattr(ccxt, exchange_name)
+exchange = exchange_class({
+    "apiKey": api_key,
+    "secret": api_secret,
+})
+
+if use_testnet:
+    if hasattr(exchange, "set_sandbox_mode"):
+        exchange.set_sandbox_mode(True)
+    print("🧪 Testnet (sandbox) modunda çalışıyor.")
+else:
+    print("⚡ Gerçek modda çalışıyor (dikkat!).")
+
+def get_ohlcv(symbol):
+    try:
+        data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
+        return df
+    except Exception as e:
+        print(f"{symbol} için veri alınamadı: {e}")
+        return None
+
+def calculate_signals(df):
+    df["SMA_short"] = df["close"].rolling(short_window).mean()
+    df["SMA_long"] = df["close"].rolling(long_window).mean()
+    df["RSI"] = calculate_rsi(df["close"], rsi_period)
+    return df
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def get_signal(df):
+    if df is None or len(df) < long_window:
+        return None
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    if last["SMA_short"] > last["SMA_long"] and prev["SMA_short"] <= prev["SMA_long"]:
+        if not rsi_enabled or last["RSI"] < 70:
+            return "BUY"
+    elif last["SMA_short"] < last["SMA_long"] and prev["SMA_short"] >= prev["SMA_long"]:
+        if not rsi_enabled or last["RSI"] > 30:
+            return "SELL"
+    return None
+
+def place_order(symbol, side, amount):
+    if dry_run:
+        print(f"💡 [DRY RUN] {symbol} için {side} emri gönderilirdi.")
+        return
+    try:
+        order = exchange.create_market_order(symbol, side.lower(), amount)
+        print(f"✅ {symbol} için {side} emri gönderildi: {order}")
+    except Exception as e:
+        print(f"🚫 {symbol} için {side} emri başarısız: {e}")
+
+def run_bot():
+    print("🤖 MEXC otomatik bot başlatıldı!")
+    while True:
+        for symbol in symbols:
+            df = get_ohlcv(symbol)
+            if df is None:
+                continue
+            df = calculate_signals(df)
+            signal = get_signal(df)
+            last_price = df["close"].iloc[-1]
+            print(f"{symbol} fiyatı: {last_price:.2f} | Sinyal: {signal}")
+
+            if signal == "BUY":
+                place_order(symbol, "BUY", 0.001)
+            elif signal == "SELL":
+                place_order(symbol, "SELL", 0.001)
+
+        print(f"{poll_interval} saniye bekleniyor...\n")
+        time.sleep(poll_interval)
+
+if __name__ == "__main__":
+    run_bot()
